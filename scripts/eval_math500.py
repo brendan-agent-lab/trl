@@ -25,14 +25,17 @@ Evaluate a model on the MATH-500 benchmark using greedy decoding and math_verify
 
 Examples:
 
-    # Evaluate the GRPO-trained model (default output dir):
-    python scripts/eval_math500.py --model_name_or_path output
+    # Evaluate a specific checkpoint from a timestamped training run:
+    python scripts/eval_math500.py --model_name_or_path output_20260327_143022/checkpoint-1800
 
     # Evaluate the base model for comparison:
     python scripts/eval_math500.py --model_name_or_path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
 
     # With custom generation settings:
-    python scripts/eval_math500.py --model_name_or_path output --max_tokens 4096 --temperature 0.0
+    python scripts/eval_math500.py --model_name_or_path output_20260327_143022/checkpoint-1800 --max_tokens 4096 --temperature 0.0
+
+    # Evaluate an intermediate checkpoint:
+    python scripts/eval_math500.py --model_name_or_path output_20260327_143022/checkpoint-100
 """
 
 from dataclasses import dataclass, field

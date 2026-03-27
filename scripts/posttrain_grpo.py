@@ -1,30 +1,54 @@
+from dataclasses import dataclass, field
+from datetime import datetime
+
 from datasets import load_dataset
+from transformers import HfArgumentParser
 from trl import GRPOTrainer, GRPOConfig
 from trl.rewards import accuracy_reward
 
-dataset = load_dataset("trl-lib/DeepMath-103K", split="train")
 
-training_args = GRPOConfig(
-    output_dir="output",
-    save_strategy="steps",
-    save_steps=100,
-    report_to="wandb",
-    learning_rate=1e-6,
-    beta=0.001,
-    max_completion_length=4096,
-    num_generations=4,
-    temperature=0.6,
-    max_steps=1800,
-    max_grad_norm=5.0,
-    per_device_train_batch_size=1,
-    gradient_accumulation_steps=16,
-    use_vllm=False, # restricted to 1 task on 1 GPU
-)
+@dataclass
+class ScriptArguments:
+    model_name_or_path: str = field(
+        default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        metadata={"help": "Model name or path to train from."},
+    )
+    output_dir: str = field(
+        default=None,
+        metadata={"help": "Output directory. Defaults to 'output_YYYYMMDD_HHMMSS'."},
+    )
 
-trainer = GRPOTrainer(
-    model="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
-    reward_funcs=accuracy_reward,
-    train_dataset=dataset,
-    args=training_args,
-)
-trainer.train()
+
+if __name__ == "__main__":
+    parser = HfArgumentParser(ScriptArguments)
+    script_args = parser.parse_args_into_dataclasses()[0]
+
+    if script_args.output_dir is None:
+        script_args.output_dir = f"output_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    dataset = load_dataset("trl-lib/DeepMath-103K", split="train")
+
+    training_args = GRPOConfig(
+        output_dir=script_args.output_dir,
+        save_strategy="steps",
+        save_steps=100,
+        report_to="wandb",
+        learning_rate=1e-6,
+        beta=0.001,
+        max_completion_length=4096,
+        num_generations=4,
+        temperature=0.6,
+        max_steps=1800,
+        max_grad_norm=5.0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=16,
+        use_vllm=False,  # restricted to 1 task on 1 GPU
+    )
+
+    trainer = GRPOTrainer(
+        model=script_args.model_name_or_path,
+        reward_funcs=accuracy_reward,
+        train_dataset=dataset,
+        args=training_args,
+    )
+    trainer.train()
