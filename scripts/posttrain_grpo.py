@@ -6,6 +6,8 @@ dataset = load_dataset("trl-lib/DeepMath-103K", split="train")
 
 training_args = GRPOConfig(
     output_dir="output",
+    save_strategy="steps",
+    save_steps=100,
     report_to="wandb",
     learning_rate=1e-6,
     beta=0.001,
