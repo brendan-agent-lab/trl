@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from datasets import load_dataset
-from transformers import HfArgumentParser
+from transformers import AutoTokenizer, HfArgumentParser
 from trl import GRPOTrainer, GRPOConfig
 from trl.rewards import accuracy_reward
 
@@ -36,7 +36,7 @@ if __name__ == "__main__":
         learning_rate=1e-6,
         beta=0.001,
         max_completion_length=4096,
-        num_generations=4,
+        num_generations=8,
         temperature=0.6,
         max_steps=1800,
         max_grad_norm=5.0,
@@ -45,8 +45,11 @@ if __name__ == "__main__":
         use_vllm=False,  # restricted to 1 task on 1 GPU
     )
 
+    tokenizer = AutoTokenizer.from_pretrained(script_args.model_name_or_path)
+
     trainer = GRPOTrainer(
         model=script_args.model_name_or_path,
+        processing_class=tokenizer,
         reward_funcs=accuracy_reward,
         train_dataset=dataset,
         args=training_args,
