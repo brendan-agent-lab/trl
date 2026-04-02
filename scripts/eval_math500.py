@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 
 import json
 import os
+from datetime import datetime
 
 from datasets import load_dataset
 from transformers import AutoTokenizer, HfArgumentParser
@@ -128,3 +129,29 @@ if __name__ == "__main__":
     print(f"Correct: {int(num_correct)}")
     print(f"Accuracy: {accuracy:.2f}%")
     print(f"{'=' * 50}")
+
+    # Save results to JSON
+    results = {
+        "metadata": {
+            "model_name_or_path": script_args.model_name_or_path,
+            "dataset": script_args.dataset_name,
+            "max_tokens": script_args.max_tokens,
+            "temperature": script_args.temperature,
+            "tensor_parallel_size": script_args.tensor_parallel_size,
+            "timestamp": datetime.now().isoformat(),
+        },
+        "results": {
+            "total_examples": len(rewards),
+            "num_valid": num_valid,
+            "num_skipped": num_skipped,
+            "num_correct": int(num_correct),
+            "accuracy": accuracy,
+        },
+    }
+    os.makedirs("output/benchmarks", exist_ok=True)
+    model_slug = script_args.model_name_or_path.replace("/", "_")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = f"output/benchmarks/{model_slug}_{timestamp}.json"
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Results saved to {output_path}")
