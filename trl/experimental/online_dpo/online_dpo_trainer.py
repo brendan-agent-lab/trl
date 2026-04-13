@@ -17,11 +17,9 @@ import re
 import textwrap
 from collections.abc import Callable
 from contextlib import nullcontext
-from functools import wraps
 from pathlib import Path
 from typing import Any
 
-import jinja2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,7 +30,7 @@ from accelerate.utils import broadcast_object_list, gather_object, is_peft_model
 from datasets import Dataset
 from packaging.version import Version
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import IterableDataset
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
@@ -42,12 +40,11 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizerBase,
     ProcessorMixin,
-    Trainer,
     TrainerCallback,
     is_bitsandbytes_available,
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
-from transformers.trainer_utils import EvalPrediction, seed_worker
+from transformers.trainer_utils import EvalPrediction
 from transformers.training_args import OptimizerNames
 from transformers.utils import is_flash_attn_2_available, is_peft_available, is_sagemaker_mp_enabled
 
@@ -58,15 +55,7 @@ from ...import_utils import is_vllm_available
 from ...models.utils import prepare_deepspeed, prepare_fsdp, unwrap_model_for_generation
 from ...trainer.base_trainer import _BaseTrainer
 from ...trainer.utils import disable_dropout_in_model, ensure_master_addr_port, get_config_model_id, pad
-from ..judges import BasePairwiseJudge
-from ..utils import (
-    SIMPLE_CHAT_TEMPLATE,
-    DPODataCollatorWithPadding,
-    create_reference_model,
-    empty_cache,
-    prepare_peft_model,
-    truncate_right,
-)
+from ..utils import DPODataCollatorWithPadding, create_reference_model, empty_cache, prepare_peft_model, truncate_right
 from .online_dpo_config import OnlineDPOConfig
 
 
@@ -96,9 +85,11 @@ if is_bitsandbytes_available():
 
 logger = logging.get_logger(__name__)
 
-# What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
-# rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
-RewardFunc = str | PreTrainedModel | Callable[[list, list], list[float]]
+# A reward function can be a string, interpreted as a model ID and loaded as a pretrained model, a pretrained model, or
+# a callable that returns a list of floats (the rewards). The callable receives prompts, completions, and additional
+# arguments from the trainer (refer to the trainer's source for details). To ensure forward compatibility, it should
+# accept **kwargs.
+RewardFunc = str | PreTrainedModel | Callable[..., list[float | None]]
 
 
 class OnlineDPOTrainer(_BaseTrainer):
@@ -118,17 +109,13 @@ class OnlineDPOTrainer(_BaseTrainer):
         ref_model ([`~transformers.PreTrainedModel`] or `torch.nn.Module` or `None`):
             The reference model to use for training. If None is specified, the reference model will be created from the
             model.
-        judge ([`experimental.judges.BasePairwiseJudge`]):
-            The judge to use for pairwise comparison of model completions.
-        reward_funcs (`RewardFunc | list[RewardFunc]`, *optional*):
+        reward_funcs (`RewardFunc | list[RewardFunc]`):
             Reward functions to be used for computing the rewards. To compute the rewards, we call all the reward
             functions with the prompts and completions and sum the rewards. Can be either:
 
             - A single reward function: Can be a string (path to model), a [`~transformers.PreTrainedModel`], or a
               custom callable function.
             - A list of reward functions: Must all be of compatible types.
-
-            Note: Only one of `judge`, or `reward_funcs` should be provided.
         args ([`experimental.online_dpo.OnlineDPOConfig`]):
             The online DPO config arguments to use for training.
         data_collator ([`~transformers.DataCollator`]):
@@ -184,7 +171,6 @@ class OnlineDPOTrainer(_BaseTrainer):
         model: PreTrainedModel | nn.Module | str,
         ref_model: PreTrainedModel | nn.Module | None = None,
         reward_funcs: RewardFunc | list[RewardFunc] | None = None,
-        judge: BasePairwiseJudge | None = None,
         args: OnlineDPOConfig | None = None,
         data_collator: DataCollator | None = None,
         train_dataset: Dataset | IterableDataset | None = None,
@@ -197,6 +183,9 @@ class OnlineDPOTrainer(_BaseTrainer):
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
+        if train_dataset is None:
+            raise ValueError("`train_dataset` is required")
+
         if ref_model is model:
             raise ValueError(
                 "`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the "
@@ -205,81 +194,58 @@ class OnlineDPOTrainer(_BaseTrainer):
 
         self.ref_model = ref_model
 
-        # Validate reward configuration - must have exactly one of: judge, or reward_funcs
-        reward_configs = sum(x is not None for x in [judge, reward_funcs])
-        if reward_configs == 0:
-            raise ValueError("One of `judge` or `reward_funcs` must be provided.")
-        elif reward_configs > 1:
-            if judge is not None:
-                logger.warning(
-                    "Both `judge` and `reward_funcs` are provided. Using `judge` and ignoring `reward_funcs`.",
-                    UserWarning,
-                )
-                reward_funcs = None
-        self.judge = judge
+        if reward_funcs is None:
+            raise ValueError("`reward_funcs` must be provided.")
 
         # Handle reward_funcs
-        if reward_funcs is not None:
-            if not isinstance(reward_funcs, list):
-                reward_funcs = [reward_funcs]
-            self.reward_func_names = []
+        if not isinstance(reward_funcs, list):
+            reward_funcs = [reward_funcs]
+        self.reward_func_names = []
 
-            # Process reward functions (convert strings to models, collect names)
-            model_init_kwargs = args.model_init_kwargs or {}
-            for i, reward_func in enumerate(reward_funcs):
-                if isinstance(reward_func, str):
-                    # Load model from string path
-                    reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
-                        reward_func, num_labels=1, **model_init_kwargs
-                    )
-                if isinstance(reward_funcs[i], nn.Module):
-                    self.reward_func_names.append(get_config_model_id(reward_funcs[i].config).split("/")[-1])
-                else:
-                    self.reward_func_names.append(reward_funcs[i].__name__)
-            self.reward_funcs = reward_funcs
-
-            # Handle reward processing classes for reward_funcs
-            if reward_processing_classes is None:
-                reward_processing_classes = [None] * len(reward_funcs)
-            elif not isinstance(reward_processing_classes, list):
-                reward_processing_classes = [reward_processing_classes]
+        # Process reward functions (convert strings to models, collect names)
+        model_init_kwargs = args.model_init_kwargs or {}
+        for i, reward_func in enumerate(reward_funcs):
+            if isinstance(reward_func, str):
+                # Load model from string path
+                reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
+                    reward_func, num_labels=1, **model_init_kwargs
+                )
+            if isinstance(reward_funcs[i], nn.Module):
+                self.reward_func_names.append(get_config_model_id(reward_funcs[i].config).split("/")[-1])
             else:
-                if len(reward_processing_classes) != len(reward_funcs):
-                    raise ValueError(
-                        "The number of reward processing classes must match the number of reward functions."
-                    )
+                self.reward_func_names.append(reward_funcs[i].__name__)
+        self.reward_funcs = reward_funcs
 
-            self.reward_processing_classes = []
-            for reward_processing_class_i, reward_func in zip(reward_processing_classes, reward_funcs, strict=True):
-                if isinstance(reward_func, PreTrainedModel):
-                    if reward_processing_class_i is None:
-                        reward_processing_class_i = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
-                    if reward_processing_class_i.pad_token_id is None:
-                        reward_processing_class_i.pad_token = reward_processing_class_i.eos_token
-                    # Set pad token ID on reward model config
-                    reward_func.config.pad_token_id = reward_processing_class_i.pad_token_id
-                self.reward_processing_classes.append(reward_processing_class_i)
+        # Handle reward processing classes for reward_funcs
+        if reward_processing_classes is None:
+            reward_processing_classes = [None] * len(reward_funcs)
+        elif not isinstance(reward_processing_classes, list):
+            reward_processing_classes = [reward_processing_classes]
         else:
-            self.reward_funcs = None
-            self.reward_func_names = []
-            self.reward_processing_classes = []
+            if len(reward_processing_classes) != len(reward_funcs):
+                raise ValueError("The number of reward processing classes must match the number of reward functions.")
+
+        self.reward_processing_classes = []
+        for reward_processing_class_i, reward_func in zip(reward_processing_classes, reward_funcs, strict=True):
+            if isinstance(reward_func, PreTrainedModel):
+                if reward_processing_class_i is None:
+                    reward_processing_class_i = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
+                if reward_processing_class_i.pad_token_id is None:
+                    reward_processing_class_i.pad_token = reward_processing_class_i.eos_token
+                # Set pad token ID on reward model config
+                reward_func.config.pad_token_id = reward_processing_class_i.pad_token_id
+            self.reward_processing_classes.append(reward_processing_class_i)
 
         # Handle reward_weights
-        if reward_funcs is not None:
-            if args.reward_weights is not None:
-                if len(args.reward_weights) != len(self.reward_funcs):
-                    raise ValueError(
-                        f"Number of reward weights ({len(args.reward_weights)}) must match number of reward "
-                        f"functions ({len(self.reward_funcs)})"
-                    )
-                self.reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32)
-            else:
-                self.reward_weights = torch.ones(len(self.reward_funcs), dtype=torch.float32)
+        if args.reward_weights is not None:
+            if len(args.reward_weights) != len(self.reward_funcs):
+                raise ValueError(
+                    f"Number of reward weights ({len(args.reward_weights)}) must match number of reward "
+                    f"functions ({len(self.reward_funcs)})"
+                )
+            self.reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32)
         else:
-            self.reward_weights = None
-
-        if args.missing_eos_penalty is not None and reward_funcs is None and judge is None:
-            raise ValueError("`missing_eos_penalty` is only supported when `reward_funcs` is provided.")
+            self.reward_weights = torch.ones(len(self.reward_funcs), dtype=torch.float32)
 
         if args is None:
             raise ValueError("`args` must be provided.")
@@ -509,7 +475,7 @@ class OnlineDPOTrainer(_BaseTrainer):
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
 
             # Set up vLLM generation config
-            generation_params = {
+            generation_kwargs = {
                 "n": 2,  # 2 generations per prompt for Online DPO
                 "repetition_penalty": self.repetition_penalty,
                 "temperature": self.temperature,
@@ -520,18 +486,17 @@ class OnlineDPOTrainer(_BaseTrainer):
                 "detokenize": False,  # to avoid vllm to decode (we don't need it)
             }
             if args.generation_kwargs is not None:
-                generation_params.update(args.generation_kwargs)
+                generation_kwargs.update(args.generation_kwargs)
             if self.structured_outputs_regex is not None:
-                if generation_params.get("structured_outputs") is not None:
+                if generation_kwargs.get("structured_outputs") is not None:
                     logger.warning(
                         "Both `vllm_structured_outputs_regex` and `generation_kwargs['structured_outputs']` are set; "
                         "`vllm_structured_outputs_regex` takes precedence."
                     )
-                generation_params["structured_outputs"] = StructuredOutputsParams(regex=self.structured_outputs_regex)
-            elif isinstance(generation_params.get("structured_outputs"), dict):
-                structured_outputs_dict = generation_params.get("structured_outputs")
-                generation_params["structured_outputs"] = StructuredOutputsParams(**structured_outputs_dict)
-            self.generation_config = SamplingParams(**generation_params)
+                generation_kwargs["structured_outputs"] = StructuredOutputsParams(regex=self.structured_outputs_regex)
+            elif isinstance(structured_outputs_kwargs := generation_kwargs.get("structured_outputs"), dict):
+                generation_kwargs["structured_outputs"] = StructuredOutputsParams(**structured_outputs_kwargs)
+            self.generation_config = SamplingParams(**generation_kwargs)
 
             # When using vLLM, the main process is responsible for loading the model weights. This can cause process
             # desynchronization and seems to lead to DeepSpeed hanging during initialization. To prevent this, we
@@ -603,79 +568,6 @@ class OnlineDPOTrainer(_BaseTrainer):
             batch = tokenizer(feature["prompt"], add_special_tokens=True)
         batch = {f"prompt_{key}": value for key, value in batch.items()}
         return batch
-
-    # Same as Trainer.get_train_dataloader but skip the "remove_unused_columns".
-    @wraps(Trainer.get_train_dataloader)
-    def get_train_dataloader(self) -> DataLoader:
-        if self.train_dataset is None:
-            raise ValueError("Trainer: training requires a train_dataset.")
-
-        train_dataset = self.train_dataset
-        data_collator = self.data_collator
-        dataloader_params = {
-            "batch_size": self._train_batch_size,
-            "collate_fn": data_collator,
-            "num_workers": self.args.dataloader_num_workers,
-            "pin_memory": self.args.dataloader_pin_memory,
-            "persistent_workers": self.args.dataloader_persistent_workers,
-        }
-
-        if not isinstance(train_dataset, torch.utils.data.IterableDataset):
-            dataloader_params["sampler"] = self._get_train_sampler()
-            dataloader_params["drop_last"] = self.args.dataloader_drop_last
-            dataloader_params["worker_init_fn"] = seed_worker
-            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
-
-        return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
-
-    # Same as Trainer.get_eval_dataloader but skip the "remove_unused_columns".
-    @wraps(Trainer.get_eval_dataloader)
-    def get_eval_dataloader(self, eval_dataset: str | Dataset | None = None) -> DataLoader:
-        if eval_dataset is None and self.eval_dataset is None:
-            raise ValueError("Trainer: evaluation requires an eval_dataset.")
-
-        # If we have persistent workers, don't do a fork bomb especially as eval datasets
-        # don't change during training
-        dataloader_key = eval_dataset if isinstance(eval_dataset, str) else "eval"
-        if (
-            hasattr(self, "_eval_dataloaders")
-            and dataloader_key in self._eval_dataloaders
-            and self.args.dataloader_persistent_workers
-        ):
-            return self.accelerator.prepare(self._eval_dataloaders[dataloader_key])
-
-        eval_dataset = (
-            self.eval_dataset[eval_dataset]
-            if isinstance(eval_dataset, str)
-            else eval_dataset
-            if eval_dataset is not None
-            else self.eval_dataset
-        )
-        data_collator = self.data_collator
-
-        dataloader_params = {
-            "batch_size": self.args.eval_batch_size,
-            "collate_fn": data_collator,
-            "num_workers": self.args.dataloader_num_workers,
-            "pin_memory": self.args.dataloader_pin_memory,
-            "persistent_workers": self.args.dataloader_persistent_workers,
-        }
-
-        if not isinstance(eval_dataset, torch.utils.data.IterableDataset):
-            dataloader_params["sampler"] = self._get_eval_sampler(eval_dataset)
-            dataloader_params["drop_last"] = self.args.dataloader_drop_last
-            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
-
-        # accelerator.free_memory() will destroy the references, so
-        # we need to store the non-prepared version
-        eval_dataloader = DataLoader(eval_dataset, **dataloader_params)
-        if self.args.dataloader_persistent_workers:
-            if hasattr(self, "_eval_dataloaders"):
-                self._eval_dataloaders[dataloader_key] = eval_dataloader
-            else:
-                self._eval_dataloaders = {dataloader_key: eval_dataloader}
-
-        return self.accelerator.prepare(eval_dataloader)
 
     def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: OnlineDPOConfig) -> PreTrainedModel:
         """Enables gradient checkpointing for the model."""
@@ -750,7 +642,9 @@ class OnlineDPOTrainer(_BaseTrainer):
             # prompt individually.
             ordered_set_of_prompts = all_prompts[:: self.num_generations]
             if has_images:
-                ordered_set_of_images = all_images[:: self.num_generations]
+                ordered_set_of_images = [
+                    [img] if img is not None else None for img in all_images[:: self.num_generations]
+                ]
             else:
                 ordered_set_of_images = None
             completion_ids = self.vllm_client.generate(
@@ -1320,52 +1214,32 @@ class OnlineDPOTrainer(_BaseTrainer):
         if is_conversational({"prompt": prompts[0]}):
             completions = [[{"role": "assistant", "content": completion}] for completion in completions]
 
-        # Get the reward from reward functions or judge
-        if self.reward_funcs is not None:
-            # First create completion_ids_list for custom reward functions
-            completion_ids_list = [completion_ids[i].tolist() for i in range(completion_ids.shape[0])]
+        # Get the reward from reward functions
+        # First create completion_ids_list for custom reward functions
+        completion_ids_list = [completion_ids[i].tolist() for i in range(completion_ids.shape[0])]
 
-            # Extract additional fields from inputs for reward functions
-            reward_kwargs = {}
-            keys = [key for key in inputs if key not in ["prompt"]]
-            for key in keys:
-                if isinstance(inputs[key], (list, tuple)):
-                    # Repeat input fields to match number of completions (2 per prompt)
-                    reward_kwargs[key] = inputs[key] * 2
-                else:
-                    reward_kwargs[key] = inputs[key]
+        # Extract additional fields from inputs for reward functions
+        reward_kwargs = {}
+        keys = [key for key in inputs if key not in ["prompt"]]
+        for key in keys:
+            if isinstance(inputs[key], (list, tuple)):
+                # Repeat input fields to match number of completions (2 per prompt)
+                reward_kwargs[key] = inputs[key] * 2
+            else:
+                reward_kwargs[key] = inputs[key]
 
-            # Calculate rewards using reward functions
-            rewards = self._calculate_rewards_from_functions(
-                prompts=2 * prompts, completions=completions, completion_ids_list=completion_ids_list, **reward_kwargs
-            )
+        # Calculate rewards using reward functions
+        rewards = self._calculate_rewards_from_functions(
+            prompts=2 * prompts, completions=completions, completion_ids_list=completion_ids_list, **reward_kwargs
+        )
 
-            # Apply missing EOS penalty if configured
-            if self.args.missing_eos_penalty is not None:
-                rewards[~contain_eos_token] -= self.args.missing_eos_penalty
+        # Apply missing EOS penalty if configured
+        if self.args.missing_eos_penalty is not None:
+            rewards[~contain_eos_token] -= self.args.missing_eos_penalty
 
-            # Split rewards into chosen/rejected pairs
-            first_half, second_half = rewards.split(batch_size)
-            mask = first_half >= second_half
-        elif self.judge is not None:
-            # Once formatted, conversational data may contain special tokens (such as <|im_start|>) that are not
-            # directly understandable by the judge and could alter its judgment. To avoid this and make the judge
-            # independent of the model's chat template, we use the raw conversation data, and apply our own chat
-            # template to it.
-            if is_conversational({"prompt": prompts[0]}):
-                environment = jinja2.Environment()
-                template = environment.from_string(SIMPLE_CHAT_TEMPLATE)
-                prompts = [template.render(messages=prompt) for prompt in prompts]
-                completions = [template.render(messages=completion) for completion in completions]
-
-            ranks_of_first_completion = self.judge.judge(
-                prompts, list(zip(completions[:batch_size], completions[batch_size:], strict=True))
-            )
-
-            # convert ranks to a True/False mask:
-            # when rank == 0, it means the first completion is the best
-            # when rank == 1, it means the second completion is the best
-            mask = torch.tensor([rank == 0 for rank in ranks_of_first_completion], device=device)
+        # Split rewards into chosen/rejected pairs
+        first_half, second_half = rewards.split(batch_size)
+        mask = first_half >= second_half
 
         batch_range = torch.arange(batch_size, device=device)
         chosen_indices = batch_range + (~mask * batch_size)
@@ -1396,7 +1270,7 @@ class OnlineDPOTrainer(_BaseTrainer):
         elif self.args.loss_type == "ipo":
             losses = (logits - 1 / (2 * self.beta)) ** 2
         else:
-            raise NotImplementedError(f"invalid loss type {self.loss_type}")
+            raise NotImplementedError(f"invalid loss type {self.args.loss_type}")
 
         loss = losses.mean()
 

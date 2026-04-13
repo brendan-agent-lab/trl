@@ -145,6 +145,9 @@ class CPOTrainer(_BaseTrainer):
         peft_config: dict | None = None,
         compute_metrics: Callable[[EvalLoopOutput], dict] | None = None,
     ):
+        if train_dataset is None:
+            raise ValueError("`train_dataset` is required")
+
         if args.model_init_kwargs is None:
             model_init_kwargs = {}
         elif not isinstance(model, str):
@@ -288,7 +291,6 @@ class CPOTrainer(_BaseTrainer):
 
         self.max_length = max_length
         self.generate_during_eval = args.generate_during_eval
-        self.truncation_mode = args.truncation_mode
         self.max_completion_length = max_completion_length
         self.processing_class = processing_class
 
@@ -481,7 +483,7 @@ class CPOTrainer(_BaseTrainer):
             # and length only differs by 1 at most
             num_diff_tokens = sum(
                 a != b
-                for a, b in zip(chosen_tokens["prompt_input_ids"], rejected_tokens["prompt_input_ids"], strict=True)
+                for a, b in zip(chosen_tokens["prompt_input_ids"], rejected_tokens["prompt_input_ids"], strict=False)
             )
             num_diff_len = abs(chosen_prompt_len_input_ids - rejected_prompt_len_input_ids)
             if num_diff_tokens > 1 or num_diff_len > 1:

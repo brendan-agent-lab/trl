@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
-
-from transformers import TrainingArguments
 
 from .base_config import _BaseConfig
 
@@ -61,20 +60,21 @@ class SFTConfig(_BaseConfig):
         eos_token (`str`, *optional*):
             Token used to indicate the end of a turn or sequence. If `None`, it defaults to
             `processing_class.eos_token`.
-        pad_token (`str`, *optional*):
-            Token used for padding. If `None`, it defaults to `processing_class.pad_token`, or if that is also `None`,
-            it falls back to `processing_class.eos_token`.
         max_length (`int` or `None`, *optional*, defaults to `1024`):
-            Maximum length of the tokenized sequence. Sequences longer than `max_length` are truncated from the right.
-            If `None`, no truncation is applied. When packing is enabled, this value sets the sequence length.
+            Maximum length of the tokenized sequence. Sequences longer than `max_length` are truncated from the left
+            or right depending on `truncation_mode`. If `None`, no truncation is applied. When packing is enabled,
+            this value sets the sequence length.
+        truncation_mode (`str`, *optional*, defaults to `"keep_start"`):
+            Truncation mode to use when the sequence exceeds `max_length`. The only supported value is
+            `"keep_start"`. The `"keep_end"` value is deprecated and will be removed in v2.0.0.
         shuffle_dataset (`bool`, *optional*, defaults to `False`):
             Whether to shuffle the dataset.
         packing (`bool`, *optional*, defaults to `False`):
             Whether to group multiple sequences into fixed-length blocks to improve computational efficiency and reduce
             padding. Uses `max_length` to define sequence length.
         packing_strategy (`str`, *optional*, defaults to `"bfd"`):
-            Strategy for packing sequences. Can be `"bfd"` (best-fit decreasing, truncates overflow), `"bfd-requeue"`
-            (best-fit decreasing, re-queues overflow tokens), or `"wrapped"` (aggressive, cuts mid-sequence).
+            Strategy for packing sequences. Can be `"bfd"` (best-fit decreasing, truncates overflow), `"bfd_split"`
+            (best-fit decreasing, splits overflow sequences), or `"wrapped"` (aggressive, cuts mid-sequence).
         padding_free (`bool`, *optional*, defaults to `False`):
             Whether to perform forward passes without padding by flattening all sequences in the batch into a single
             continuous sequence. This reduces memory usage by eliminating padding overhead. Currently, this is only
@@ -104,6 +104,17 @@ class SFTConfig(_BaseConfig):
         activation_offloading (`bool`, *optional*, defaults to `False`):
             Whether to offload the activations to the CPU.
 
+        > Deprecated parameters
+
+        pad_token:
+
+            <Deprecated version="1.1.0">
+
+            Parameter `pad_token` is deprecated and will be removed in version v2.0.0. Set `tokenizer.pad_token`
+            directly and pass it as `processing_class` to the trainer instead.
+
+            </Deprecated>
+
     > [!NOTE]
     > These parameters have default values different from [`~transformers.TrainingArguments`]:
     > - `logging_steps`: Defaults to `10` instead of `500`.
@@ -112,7 +123,7 @@ class SFTConfig(_BaseConfig):
     > - `learning_rate`: Defaults to `2e-5` instead of `5e-5`.
     """
 
-    _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS + ["model_init_kwargs"]
+    _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + ["model_init_kwargs"]
 
     # Parameters whose default values are overridden from TrainingArguments
     learning_rate: float = field(
@@ -121,7 +132,7 @@ class SFTConfig(_BaseConfig):
     )
 
     # Parameters that control the model
-    model_init_kwargs: dict[str, Any] | None = field(
+    model_init_kwargs: dict[str, Any] | str | None = field(
         default=None,
         metadata={
             "help": "Keyword arguments for `AutoModelForCausalLM.from_pretrained`, used when the `model` argument of "
@@ -164,19 +175,20 @@ class SFTConfig(_BaseConfig):
             "help": "Token used to indicate the end of a turn or sequence. If `None`, it defaults to `processing_class.eos_token`."
         },
     )
-    pad_token: str | None = field(
-        default=None,
-        metadata={
-            "help": "Token used for padding. If `None`, it defaults to `processing_class.pad_token`, or if that "
-            "is also `None`, it falls back to `processing_class.eos_token`."
-        },
-    )
     max_length: int | None = field(
         default=1024,
         metadata={
             "help": "Maximum length of the tokenized sequence. Sequences longer than `max_length` are truncated from "
-            "the right. If `None`, no truncation is applied. When packing is enabled, this value sets the "
-            "sequence length."
+            "the left or right depending on the `truncation_mode`. If `None`, no truncation is applied. When packing "
+            "is enabled, this value sets the sequence length."
+        },
+    )
+    truncation_mode: str = field(
+        default="keep_start",
+        metadata={
+            "help": "Truncation mode to use when the sequence exceeds `max_length`. The only supported value is "
+            "`'keep_start'`. The `'keep_end'` value is deprecated and will be removed in v2.0.0.",
+            "choices": ["keep_end", "keep_start"],
         },
     )
     shuffle_dataset: bool = field(
@@ -194,9 +206,9 @@ class SFTConfig(_BaseConfig):
         default="bfd",
         metadata={
             "help": "Strategy for packing sequences. Can be `'bfd'` (best-fit decreasing, truncates overflow), "
-            "`'bfd-requeue'` (best-fit decreasing, re-queues overflow tokens), or `'wrapped'` (aggressive, cuts "
+            "`'bfd_split'` (best-fit decreasing, splits overflow sequences), or `'wrapped'` (aggressive, cuts "
             "mid-sequence).",
-            "choices": ["bfd", "bfd-requeue", "wrapped"],
+            "choices": ["bfd", "bfd_split", "wrapped"],
         },
     )
     padding_free: bool = field(
@@ -254,3 +266,36 @@ class SFTConfig(_BaseConfig):
         default=False,
         metadata={"help": "Whether to offload the activations to the CPU."},
     )
+
+    # Deprecated parameters
+    pad_token: str | None = field(
+        default=None,
+        metadata={
+            "help": "Deprecated. Set `tokenizer.pad_token` directly and pass it as `processing_class` to the trainer instead."
+        },
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.pad_token is not None:
+            warnings.warn(
+                "`pad_token` is deprecated and will be removed in v2.0.0. "
+                "Set `tokenizer.pad_token` directly and pass it as `processing_class` to the trainer instead.",
+                FutureWarning,
+                stacklevel=3,
+            )
+        if self.truncation_mode == "keep_end":
+            warnings.warn(
+                "The `'keep_end'` truncation mode is deprecated and will be removed in v2.0.0. "
+                "Use `truncation_mode='keep_start'` (the default) instead.",
+                FutureWarning,
+                stacklevel=3,
+            )
+        if self.packing_strategy == "bfd-requeue":
+            warnings.warn(
+                "The `bfd-requeue` packing strategy has been renamed to `bfd_split`. Please update your configuration accordingly. "
+                "The `bfd-requeue` strategy is deprecated and will be removed in v2.0.0.",
+                FutureWarning,
+                stacklevel=3,
+            )
+            self.packing_strategy = "bfd_split"

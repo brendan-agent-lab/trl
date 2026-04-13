@@ -439,6 +439,9 @@ class BCOTrainer(_BaseTrainer):
         if type(args) is TrainingArguments:
             raise ValueError("Please use `BCOConfig` instead `TrainingArguments`.")
 
+        if train_dataset is None:
+            raise ValueError("`train_dataset` is required")
+
         if not isinstance(model, str) and model is not None and ref_model is model:
             raise ValueError(
                 "`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the "
@@ -604,7 +607,6 @@ class BCOTrainer(_BaseTrainer):
 
         self.max_length = max_length
         self.generate_during_eval = args.generate_during_eval
-        self.truncation_mode = args.truncation_mode
         self.max_completion_length = max_completion_length
         self.precompute_ref_log_probs = args.precompute_ref_log_probs
 
@@ -675,7 +677,6 @@ class BCOTrainer(_BaseTrainer):
                 "is_encoder_decoder": self.is_encoder_decoder,
                 "tokenizer": processing_class,
                 "max_length": self.max_length,
-                "truncation_mode": self.truncation_mode,
                 "max_completion_length": self.max_completion_length,
             }
             train_dataset = train_dataset.map(
@@ -701,7 +702,6 @@ class BCOTrainer(_BaseTrainer):
                     "is_encoder_decoder": self.is_encoder_decoder,
                     "tokenizer": processing_class,
                     "max_length": self.max_length,
-                    "truncation_mode": self.truncation_mode,
                     "max_completion_length": self.max_completion_length,
                 }
                 eval_dataset = eval_dataset.map(
